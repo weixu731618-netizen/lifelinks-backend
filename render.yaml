@@ -8,8 +8,10 @@ services:
     envVars:
       - key: DEEPSEEK_API_KEY
         sync: false
-      - key: APP_SHARED_TOKEN
+      - key: SESSION_JWT_SECRET
         sync: false
+      - key: APPLE_BUNDLE_ID
+        value: com.weixu.lifelinks2.app
       - key: DEEPSEEK_BASE_URL
         value: https://api.deepseek.com
       - key: DEEPSEEK_MODEL

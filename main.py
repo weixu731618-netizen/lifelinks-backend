@@ -7,8 +7,10 @@ LifeLinks 后端 —— 面向 iOS App 的 AI 结构化提取服务。
 
 安全说明：
 - DeepSeek 的 API Key 只通过环境变量注入本进程，绝不返回给客户端，也不应写入任何日志。
-- 客户端调用本服务需要携带 Authorization: Bearer <APP_SHARED_TOKEN>
-  （与 DeepSeek 的 API Key 无关，只是「App-后端」之间的简单鉴权）。
+- 客户端先用 Sign in with Apple 拿到的 identity token 调 POST /auth/apple 换取本服务
+  自己签发的 session token，之后所有请求都携带 Authorization: Bearer <session_token>。
+  session token 与苹果的 identity token、DeepSeek 的 API Key 都无关，只是「App-后端」
+  之间用来区分用户身份的简单鉴权，payload 里带的是苹果分配的稳定用户标识（sub）。
 """
 import os
 import json
@@ -16,6 +18,8 @@ import time
 import logging
 from typing import Optional
 
+import jwt
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -25,7 +29,14 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("lifelinks")
 
-APP_SHARED_TOKEN = os.environ.get("APP_SHARED_TOKEN", "")
+# 签发/校验「App-后端」session token 用的密钥，务必在生产环境设置为一个随机长字符串。
+SESSION_JWT_SECRET = os.environ.get("SESSION_JWT_SECRET", "")
+SESSION_TOKEN_TTL_SECONDS = int(os.environ.get("SESSION_TOKEN_TTL_SECONDS", str(90 * 24 * 3600)))
+# 必须和 Xcode 里 PRODUCT_BUNDLE_IDENTIFIER 一致，否则会拒绝所有 Apple identity token。
+APPLE_BUNDLE_ID = os.environ.get("APPLE_BUNDLE_ID", "com.weixu.lifelinks2.app")
+APPLE_ISSUER = "https://appleid.apple.com"
+APPLE_KEYS_URL = "https://appleid.apple.com/auth/keys"
+
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
@@ -96,13 +107,98 @@ class SummarizePersonResponse(BaseModel):
     summary: str
 
 
-def check_auth(authorization: Optional[str]):
-    if not APP_SHARED_TOKEN:
-        # 未配置令牌时，仅建议在本地开发环境使用，生产环境务必设置 APP_SHARED_TOKEN。
-        return
-    expected = f"Bearer {APP_SHARED_TOKEN}"
-    if authorization != expected:
-        raise HTTPException(status_code=401, detail="未授权：Authorization 令牌不正确")
+class AppleAuthRequest(BaseModel):
+    identity_token: str = Field(..., min_length=1)
+
+
+class AppleAuthResponse(BaseModel):
+    session_token: str
+    user_id: str
+    expires_at: int
+
+
+# 进程内缓存 Apple 的 JWKS（签名公钥集合），避免每次登录都请求一次。
+_apple_jwks_cache: dict = {"keys": [], "fetched_at": 0.0}
+_APPLE_JWKS_CACHE_TTL_SECONDS = 3600
+
+
+def _get_apple_jwks() -> list[dict]:
+    now = time.monotonic()
+    if now - _apple_jwks_cache["fetched_at"] > _APPLE_JWKS_CACHE_TTL_SECONDS or not _apple_jwks_cache["keys"]:
+        try:
+            resp = httpx.get(APPLE_KEYS_URL, timeout=REQUEST_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            _apple_jwks_cache["keys"] = resp.json().get("keys", [])
+            _apple_jwks_cache["fetched_at"] = now
+        except Exception as exc:  # noqa: BLE001
+            if _apple_jwks_cache["keys"]:
+                logger.warning("刷新 Apple JWKS 失败，继续使用缓存: %s", type(exc).__name__)
+            else:
+                raise HTTPException(status_code=502, detail="无法获取 Apple 登录所需的公钥，请稍后重试。") from exc
+    return _apple_jwks_cache["keys"]
+
+
+def verify_apple_identity_token(identity_token: str) -> str:
+    """校验 Sign in with Apple 返回的 identity token，返回苹果分配的稳定用户标识（sub）。"""
+    try:
+        header = jwt.get_unverified_header(identity_token)
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(status_code=401, detail="无效的 Apple identity token") from exc
+
+    kid = header.get("kid")
+    matching_key = next((k for k in _get_apple_jwks() if k.get("kid") == kid), None)
+    if matching_key is None:
+        raise HTTPException(status_code=401, detail="无法匹配 Apple 签名公钥，请重新登录")
+
+    try:
+        public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(matching_key))
+        claims = jwt.decode(
+            identity_token,
+            key=public_key,
+            algorithms=["RS256"],
+            audience=APPLE_BUNDLE_ID,
+            issuer=APPLE_ISSUER,
+        )
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(status_code=401, detail=f"Apple identity token 校验失败：{exc}") from exc
+
+    sub = claims.get("sub")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Apple identity token 缺少用户标识")
+    return sub
+
+
+@app.post("/auth/apple", response_model=AppleAuthResponse)
+def auth_apple(payload: AppleAuthRequest):
+    if not SESSION_JWT_SECRET:
+        raise HTTPException(status_code=503, detail="服务端未配置 SESSION_JWT_SECRET，无法签发登录凭证。")
+
+    apple_sub = verify_apple_identity_token(payload.identity_token)
+
+    now = int(time.time())
+    expires_at = now + SESSION_TOKEN_TTL_SECONDS
+    session_token = jwt.encode(
+        {"sub": apple_sub, "iat": now, "exp": expires_at},
+        SESSION_JWT_SECRET,
+        algorithm="HS256",
+    )
+    logger.info("Apple 登录成功，用户 sub=%s", apple_sub)
+    return AppleAuthResponse(session_token=session_token, user_id=apple_sub, expires_at=expires_at)
+
+
+def check_auth(authorization: Optional[str]) -> str:
+    """校验 App 自己签发的 session token，返回其中的用户标识（苹果 sub），用于按用户区分/记日志。"""
+    if not SESSION_JWT_SECRET:
+        # 未配置密钥时，仅建议在本地开发环境使用，生产环境务必设置 SESSION_JWT_SECRET。
+        return "dev"
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未授权：缺少登录凭证，请先完成 Apple 登录")
+    token = authorization.removeprefix("Bearer ")
+    try:
+        claims = jwt.decode(token, SESSION_JWT_SECRET, algorithms=["HS256"])
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(status_code=401, detail="登录凭证无效或已过期，请重新登录") from exc
+    return claims.get("sub", "unknown")
 
 
 @app.get("/health")
@@ -112,7 +208,7 @@ def health():
 
 @app.post("/extract", response_model=ExtractResponse)
 def extract(payload: ExtractRequest, authorization: Optional[str] = Header(default=None)):
-    check_auth(authorization)
+    user_id = check_auth(authorization)
 
     if not DEEPSEEK_API_KEY:
         raise HTTPException(
@@ -131,7 +227,7 @@ def extract(payload: ExtractRequest, authorization: Optional[str] = Header(defau
         raise HTTPException(status_code=502, detail="AI 服务调用失败，请稍后重试。") from exc
     finally:
         elapsed = time.monotonic() - start
-        logger.info("extract 请求耗时 %.2fs", elapsed)
+        logger.info("extract 请求耗时 %.2fs，用户 sub=%s", elapsed, user_id)
 
     return result
 
@@ -202,7 +298,7 @@ JSON 结构：
 
 @app.post("/summarize_person", response_model=SummarizePersonResponse)
 def summarize_person(payload: SummarizePersonRequest, authorization: Optional[str] = Header(default=None)):
-    check_auth(authorization)
+    user_id = check_auth(authorization)
 
     if not DEEPSEEK_API_KEY:
         raise HTTPException(
@@ -220,7 +316,7 @@ def summarize_person(payload: SummarizePersonRequest, authorization: Optional[st
         raise HTTPException(status_code=502, detail="AI 服务调用失败，请稍后重试。") from exc
     finally:
         elapsed = time.monotonic() - start
-        logger.info("summarize_person 请求耗时 %.2fs", elapsed)
+        logger.info("summarize_person 请求耗时 %.2fs，用户 sub=%s", elapsed, user_id)
 
     return SummarizePersonResponse(summary=summary)
 
