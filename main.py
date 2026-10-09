@@ -63,7 +63,8 @@ class PersonOut(BaseModel):
     organization: Optional[str] = None    # 所属公司/组织
     birth_date: Optional[str] = None      # "YYYY-MM-DD"；只知道年月时日填 01；完全无法判断则留空，不得编造
     relation_to_me: Optional[str] = None  # 与说话人的关系标签，如"同学""朋友""同事""家人"
-    hometown: Optional[str] = None        # 籍贯/常住地
+    hometown: Optional[str] = None        # 籍贯（老家），不是现居地
+    residence: Optional[str] = None       # 常住地（现居城市）；搬家后以最新一次提到的为准
     facts: list[str] = []                 # 其他无法归入固定字段的开放性事实，每条一句话
 
 
@@ -189,8 +190,10 @@ def auth_apple(payload: AppleAuthRequest):
 def check_auth(authorization: Optional[str]) -> str:
     """校验 App 自己签发的 session token，返回其中的用户标识（苹果 sub），用于按用户区分/记日志。"""
     if not SESSION_JWT_SECRET:
-        # 未配置密钥时，仅建议在本地开发环境使用，生产环境务必设置 SESSION_JWT_SECRET。
-        return "dev"
+        # 默认拒绝：忘记配置密钥时不能让所有人免登录调用。本地调试需显式设置 ALLOW_INSECURE_DEV=1。
+        if os.environ.get("ALLOW_INSECURE_DEV") == "1":
+            return "dev"
+        raise HTTPException(status_code=503, detail="服务端未配置 SESSION_JWT_SECRET，已拒绝请求。")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="未授权：缺少登录凭证，请先完成 Apple 登录")
     token = authorization.removeprefix("Bearer ")
@@ -252,6 +255,7 @@ JSON 结构：
 {
   "persons": [{"name": "", "aliases": [], "how_met": "", "gender": "", "occupation": "",
                "organization": "", "birth_date": "YYYY-MM-DD", "relation_to_me": "", "hometown": "",
+               "residence": "",
                "facts": []}],
   "relationships": [{"kind": "introduced_by|family|friend|colleague|partner|org_role|client|supplier|other",
                       "from_name": "", "to_name": "", "to_org_name": "", "role_title": "", "note": ""}],
@@ -267,6 +271,11 @@ JSON 结构：
 3. person 的 birth_date 只有在原文明确给出年份时才填写，只知道年龄时不要反推具体出生日期。
 4. relationship 的 kind 必须是给定枚举之一，无法归类用 other。
 5. 每个人只出现一次在 persons 中，即使多次提到。
+   例外：同一段文字里如果明显是几个不同的人但称呼相同（如"王总""李哥"出现多个，
+   原文用公司、职业、地点等区分了他们），必须拆成多个 person，name 在称呼后用全角括号加上
+   最能区分的特征，例如"王总（万科）""王总（做建材的）"；relationships 的 from_name/to_name、
+   commitments 的 counterpart_name 里引用他们时，必须写成与 persons 中完全一致的 name。
+   原文没有任何可区分信息、无法判断是几个人时，当作同一个人，不要硬拆。
 6. due_date_text 保留原文的模糊时间表达（如"下周五"、"月底"），不要自己换算成具体日期。
 7. persons 列表不要包含"我"/说话人自己，只列出说话人之外提到的其他人物；但 relationships、
    commitments 中涉及"我"的地方，from_name/counterpart_name 可以正常写"我"。
@@ -275,7 +284,11 @@ JSON 结构：
    老张是被引荐对象），而不是以"我"作为 from_name，因为这样会丢失谁是介绍人这个关键信息。
 9. relation_to_me 只在原文明确体现说话人与该人物的关系时填写（如"我同学老张""朋友老李"），
    没有明确体现就留空，不要瞎猜。
-10. facts 用来装其他所有不属于 gender/occupation/organization/birth_date/hometown 的、
+9b. hometown 只填籍贯/老家（"浙江人""老家四川"）；residence 只填现在住在哪个城市
+   （"住在杭州""常驻深圳""搬到上海了"）。两者不要混填：原文只说"在杭州"且看不出是老家
+   还是现居地时，按现居地填 residence，hometown 留空。organization、occupation、residence
+   原文表达了变动（"跳槽去了B公司""现在转做销售""搬到成都了"）时，填变动之后的最新值。
+10. facts 用来装其他所有不属于 gender/occupation/organization/birth_date/hometown/residence 的、
     关于这个人的具体事实，只要原文提到就写一条，每条一句简短的话，不要归纳总结，
     也不要编造。参考但不限于这些维度：婚姻状况、子女情况、学历/毕业院校、行业、职级、
     副业、收入、兴趣爱好、运动习惯、饮食偏好、宠物、旅行偏好、性格特点、沟通偏好、
@@ -287,6 +300,15 @@ JSON 结构：
       不要填事情本身发生的时间。
     - content 里把事情本身的时间作为背景说清楚，例如"3:50接徐小朵放学（提前在3:40提醒）"。
     只有单一时间点、不存在"事件时间 vs 提醒时间"这种区分时，按原来的方式处理即可。
+13. commitments 只记录"跟我有关、将来需要提醒我"的事：我要做的事（direction=mine）、
+    对方答应我或欠我的事（direction=theirs，例如"他答应下周还我100美金"）、我和对方的约定或
+    需要跟进的事（direction=general）。以下情况一律不要写进 commitments：
+    - 对方自己做的、与我无关的事，例如"张大伟昨天空投领了100美金"，这只是关于张大伟的信息，
+      写进这个人的 facts 即可；
+    - 已经发生的事（时间在过去），例如"昨天……"，它是事实，不是需要提醒的事项。
+    只有一个人自己的事（我要吃药、我要交材料），没有对方时，counterpart_name 留空。
+14. money_mentions 只记录涉及"我"的收支（我收到、我付出、对方欠我或我欠对方）。别人自己的收入
+    或花费（如"张大伟领了100美金空投"）与我无关，不要写进 money_mentions。
 12. 判断 facts 该拆成几条时，先分清楚"关于这个人的不同维度信息"和"同一件事按先后顺序
     发生的经过"：前者才按第10条拆成多条，后者只算一件事，只写一条（或者根本不写进
     facts，因为原始记录里已经保留了完整经过）。例如"今天过来，约好4:56，6点还没来，

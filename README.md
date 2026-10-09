@@ -36,7 +36,7 @@ uvicorn main:app --reload --port 8000
 ## 安全
 
 - `DEEPSEEK_API_KEY` 只存在于服务端环境变量，不会出现在任何响应或日志中。
-- `SESSION_JWT_SECRET` 未设置时 `check_auth` 会直接放行（仅适合本地开发），正式对外部署前
+- `SESSION_JWT_SECRET` 未设置时 `check_auth` 会拒绝所有请求（本地调试可设 `ALLOW_INSECURE_DEV=1` 临时放行），正式对外部署前
   必须设置为随机字符串，且 `APPLE_BUNDLE_ID` 必须和 App 的 bundle id 一致。
 - `/auth/apple` 会校验 Apple identity token 的签名（Apple 官方 JWKS）、`iss`、`aud`、`exp`，
   校验通过后才签发本服务自己的 session token，不会把 Apple 的 token 原样透传或存储。
