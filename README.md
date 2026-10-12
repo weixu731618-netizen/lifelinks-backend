@@ -31,6 +31,16 @@ uvicorn main:app --reload --port 8000
 `POST /extract` / `POST /summarize_person`
 - Header: `Authorization: Bearer <session_token>`（来自 /auth/apple）
 
+`POST /account/delete`
+- Header: `Authorization: Bearer <session_token>`
+- Body: `{"authorization_code": "<App 重新做 Apple 验证拿到的 code>"}`
+- 配置了 `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` 时，会用 code 换 token 并撤销 Apple 授权；
+  未配置则只返回 `apple_revoked=false`（上架前必须配置）。
+- 返回：`{"deleted": true, "apple_revoked": true}`
+
+`GET /privacy`、`GET /terms`：隐私政策与用户协议 HTML 页面，内容在 `legal.py`；
+运营者与联系邮箱由环境变量 `OPERATOR_NAME`、`CONTACT_EMAIL` 提供。
+
 `GET /health` 用于探活。
 
 ## 安全

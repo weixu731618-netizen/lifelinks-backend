@@ -22,7 +22,10 @@ import jwt
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+
+import legal
 
 load_dotenv()
 
@@ -36,6 +39,13 @@ SESSION_TOKEN_TTL_SECONDS = int(os.environ.get("SESSION_TOKEN_TTL_SECONDS", str(
 APPLE_BUNDLE_ID = os.environ.get("APPLE_BUNDLE_ID", "com.weixu.lifelinks2.app")
 APPLE_ISSUER = "https://appleid.apple.com"
 APPLE_KEYS_URL = "https://appleid.apple.com/auth/keys"
+APPLE_TOKEN_URL = "https://appleid.apple.com/auth/token"
+APPLE_REVOKE_URL = "https://appleid.apple.com/auth/revoke"
+# 删除账号时撤销 Sign in with Apple 授权所需（Apple 开发者后台 → Keys 创建的 .p8 私钥）。
+# 三项都配置了才会真正调用 Apple 的 revoke 接口；未配置时只做 session 校验并返回 apple_revoked=false。
+APPLE_TEAM_ID = os.environ.get("APPLE_TEAM_ID", "9PG4KYBK7V")
+APPLE_KEY_ID = os.environ.get("APPLE_KEY_ID", "")
+APPLE_PRIVATE_KEY = os.environ.get("APPLE_PRIVATE_KEY", "").replace("\\n", "\n")
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -110,6 +120,16 @@ class SummarizePersonResponse(BaseModel):
 
 class AppleAuthRequest(BaseModel):
     identity_token: str = Field(..., min_length=1)
+
+
+class DeleteAccountRequest(BaseModel):
+    # 删除前 App 会让用户重新做一次 Apple 登录，拿到新的 authorization code 用来撤销授权。
+    authorization_code: Optional[str] = None
+
+
+class DeleteAccountResponse(BaseModel):
+    deleted: bool
+    apple_revoked: bool
 
 
 class AppleAuthResponse(BaseModel):
@@ -202,6 +222,101 @@ def check_auth(authorization: Optional[str]) -> str:
     except jwt.InvalidTokenError as exc:
         raise HTTPException(status_code=401, detail="登录凭证无效或已过期，请重新登录") from exc
     return claims.get("sub", "unknown")
+
+
+def _apple_revoke_configured() -> bool:
+    return bool(APPLE_TEAM_ID and APPLE_KEY_ID and APPLE_PRIVATE_KEY)
+
+
+def _apple_client_secret() -> str:
+    now = int(time.time())
+    return jwt.encode(
+        {"iss": APPLE_TEAM_ID, "iat": now, "exp": now + 600, "aud": APPLE_ISSUER, "sub": APPLE_BUNDLE_ID},
+        APPLE_PRIVATE_KEY,
+        algorithm="ES256",
+        headers={"kid": APPLE_KEY_ID},
+    )
+
+
+def revoke_apple_authorization(authorization_code: str, expected_sub: str) -> None:
+    """用 authorization code 换 token，确认是同一个用户后撤销本 App 在苹果处的授权。"""
+    client_secret = _apple_client_secret()
+    try:
+        token_resp = httpx.post(
+            APPLE_TOKEN_URL,
+            data={
+                "client_id": APPLE_BUNDLE_ID,
+                "client_secret": client_secret,
+                "code": authorization_code,
+                "grant_type": "authorization_code",
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="无法连接 Apple 服务，请稍后重试。") from exc
+    if token_resp.status_code != 200:
+        logger.warning("Apple token 交换失败: HTTP %s", token_resp.status_code)
+        raise HTTPException(status_code=400, detail="Apple 授权码无效或已过期，请重试。")
+
+    token_data = token_resp.json()
+    id_token = token_data.get("id_token")
+    if id_token:
+        # 此 id_token 是 TLS 直连 Apple 的响应，这里只用来核对用户一致性，不需要再验签。
+        sub = jwt.decode(id_token, options={"verify_signature": False}).get("sub")
+        if sub != expected_sub:
+            raise HTTPException(status_code=403, detail="Apple 账号与当前登录账号不一致。")
+
+    token = token_data.get("refresh_token") or token_data.get("access_token")
+    hint = "refresh_token" if token_data.get("refresh_token") else "access_token"
+    if not token:
+        raise HTTPException(status_code=502, detail="Apple 未返回可撤销的凭证，请稍后重试。")
+    try:
+        revoke_resp = httpx.post(
+            APPLE_REVOKE_URL,
+            data={
+                "client_id": APPLE_BUNDLE_ID,
+                "client_secret": client_secret,
+                "token": token,
+                "token_type_hint": hint,
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="无法连接 Apple 服务，请稍后重试。") from exc
+    if revoke_resp.status_code != 200:
+        logger.warning("Apple revoke 失败: HTTP %s", revoke_resp.status_code)
+        raise HTTPException(status_code=502, detail="撤销 Apple 授权失败，请稍后重试。")
+
+
+@app.post("/account/delete", response_model=DeleteAccountResponse)
+def delete_account(payload: DeleteAccountRequest, authorization: Optional[str] = Header(default=None)):
+    """
+    删除账号。服务端不保存任何用户内容数据，所以这里没有数据库记录要删：
+    要做的是撤销 Apple 授权（App Store 审核 5.1.1(v) 要求），之后该 session 对应的用户需重新登录才会再次授权。
+    """
+    user_id = check_auth(authorization)
+
+    revoked = False
+    if _apple_revoke_configured():
+        if not payload.authorization_code:
+            raise HTTPException(status_code=400, detail="缺少 Apple 授权码，请重新验证身份后再删除账号。")
+        revoke_apple_authorization(payload.authorization_code, user_id)
+        revoked = True
+    else:
+        logger.warning("未配置 APPLE_TEAM_ID/APPLE_KEY_ID/APPLE_PRIVATE_KEY，跳过撤销 Apple 授权")
+
+    logger.info("账号已删除，用户 sub=%s，apple_revoked=%s", user_id, revoked)
+    return DeleteAccountResponse(deleted=True, apple_revoked=revoked)
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_page():
+    return legal.privacy_html()
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page():
+    return legal.terms_html()
 
 
 @app.get("/health")

@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY main.py legal.py ./
 
 # 密钥（DEEPSEEK_API_KEY / APP_SHARED_TOKEN）通过部署平台的 secrets 注入，
 # 不打进镜像、不写进这个文件、.env 不会被拷贝进来。
