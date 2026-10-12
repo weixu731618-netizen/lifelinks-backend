@@ -16,14 +16,16 @@ import os
 import json
 import time
 import logging
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import jwt
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 import legal
 
@@ -73,9 +75,20 @@ class PersonOut(BaseModel):
     organization: Optional[str] = None    # 所属公司/组织
     birth_date: Optional[str] = None      # "YYYY-MM-DD"；只知道年月时日填 01；完全无法判断则留空，不得编造
     relation_to_me: Optional[str] = None  # 与说话人的关系标签，如"同学""朋友""同事""家人"
+    # 与说话人的主要关系，固定取值，见 RELATION_LENSES 的 key；不确定或不在取值内一律为 None。
+    primary_relation: Optional[str] = None
     hometown: Optional[str] = None        # 籍贯（老家），不是现居地
     residence: Optional[str] = None       # 常住地（现居城市）；搬家后以最新一次提到的为准
     facts: list[str] = []                 # 其他无法归入固定字段的开放性事实，每条一句话
+
+    @field_validator("primary_relation", mode="before")
+    @classmethod
+    def _normalize_primary_relation(cls, value):
+        # 模型偶尔会返回空串、大小写不同或取值之外的词，统一收敛成 None，不让脏值进到 App。
+        if not isinstance(value, str):
+            return None
+        value = value.strip().lower()
+        return value if value in RELATION_LENSES else None
 
 
 class RelationshipOut(BaseModel):
@@ -112,6 +125,8 @@ class ExtractResponse(BaseModel):
 
 class SummarizePersonRequest(BaseModel):
     profile_text: str = Field(..., min_length=1, max_length=6000)
+    # 用户与此人的主要关系，取值见 RELATION_LENSES；缺省或不认识的值一律按通用语气处理。
+    primary_relation: Optional[str] = None
 
 
 class SummarizePersonResponse(BaseModel):
@@ -350,17 +365,73 @@ def extract(payload: ExtractRequest, authorization: Optional[str] = Header(defau
     return result
 
 
-SUMMARIZE_SYSTEM_PROMPT = """你是一个帮用户总结"这个人"的助手，服务对象是靠人脉办事的人（销售/创业者/做社群等），
-不是普通聊天助手。输入是关于某个人的结构化要点（基础信息、能提供什么、已知事实、承诺与人情往来情况），
-输出一段 120-200 字的自然语言中文总结，直接给出结论性的判断供参考，不要用"可能""也许"这类模糊词回避判断。
+SUMMARIZE_SYSTEM_PROMPT = """你在帮用户记住身边的人。用户会在见面或联系某个人之前看这段话，
+目的是想起他是谁、他在意什么，让彼此的关系更近一步。输入是关于某个人的结构化要点
+（基础信息、已知事实、承诺与往来情况），输出一段 100-160 字的中文总结。
+语气像一位了解用户的朋友在轻声提醒：自然、具体、有温度，不要像报告或评估。
 
 要求：
-1. 只根据给出的要点做总结/推断，不要编造要点之外的具体事实（姓名、公司、金额等）。
-2. 总结要覆盖：这个人是谁、他能提供什么帮助、当前关系处于什么状态（比如是否有未还人情、
-   未完成的承诺、多久没联系了）。哪一项要点里没有信息，就不提，不要为了凑内容编造。
-3. 如果要点里明显有"欠人情""承诺逾期""很久没联系"这类信号，要直接指出，不要含糊其辞。
-4. 只输出总结正文，不要输出标题、不要用 markdown、不要输出多余说明或免责声明。
+1. 只根据给出的要点，不要编造要点之外的任何内容，包括具体事实（姓名、公司、金额、经历）
+   和心理、情绪（例如“你心里一直记着”“他应该很在意”“家里也惦记着”）。
+   哪一项要点里没有信息，就不提，不要为了凑内容编造。
+2. 内容顺序：先说他是谁、最近在意什么或经历了什么（要点里有才说，是否能提私人信息以“关系说明”为准）；
+   再说你们之间的状态（上次联系是多久前、有没有没兑现的约定）。
+   不要提“他能提供什么”“他有什么资源”。
+3. 没兑现的承诺、很久没联系：只照实陈述事实（例如“原定九月底，还没有回音”），
+   不评判，不吓唬用户，不使用“逾期”“转冷”“风险”“需尽快处理”这类词。
+4. 总结到事实和状态为止，不要给行动建议，不要以“可以”“不妨”“建议”之类的话收尾。
+5. 有信息的地方直接说，不要用“可能”“也许”绕开；没有信息的地方不要猜。
+6. 只输出总结正文，不要输出标题、不要用 markdown、不要输出多余说明或免责声明。
 """
+
+# 用户与此人的主要关系 -> 追加到总结 prompt 末尾的一小段语气说明。
+# key 是与 App 约定的英文取值；缺省或不认识的取值走 NEUTRAL_LENS，由代码选择，不让模型自行判断关系。
+NEUTRAL_LENS = (
+    "用户与这个人的关系尚未确定：用中性语气，不要假设你们很亲近，也不要假设对方是客户或上级。"
+    "要点里有他的家人、健康等情况，照常提，这是让人感到被记得的地方。"
+)
+RELATION_LENSES = {
+    "friend": (
+        "用户与这个人是朋友：语气随意自然，像朋友之间聊天。可以提他的家人、生活和近况。"
+    ),
+    "family": (
+        "用户与这个人是亲属：像家里人说话，温和。可以提健康、孩子和长辈。"
+        "不要使用“跟进”“推进”“对接”“答复”“回音”这类办事的词。"
+    ),
+    "superior": (
+        "这个人是用户的上级（领导、老板，也包括老师、导师）：称呼对方时带上职务或身份，用“你”称呼用户。"
+        "先谈他的工作、目标和压力（老师、导师则谈他的研究和对用户的指导），以及用户答应他的事。"
+        "语气尊重、有分寸，不要过分亲昵。要点里有他的家人、健康等情况，也要简短提到，口吻是惦记，不是打探。"
+    ),
+    "client": (
+        "这个人是用户的客户：先谈他的事顺不顺、他的问题有没有解决，以及用户答应他的事。"
+        "语气真诚，不要显得在“经营”他。要点里有他的家人、健康、孩子等情况，也要提到，"
+        "这正是让对方感到被记得的地方（例如他生病了、孩子要高考）。"
+    ),
+    "partner": (
+        "这个人是用户的合作方（供应商、合伙人、投资人、渠道等）：先把约定、交付、付款或合作的进展说清楚，"
+        "这是对方最在意的。语气平等、守信用。要点里有他的家人、健康等情况，在最后简短提一句。"
+    ),
+    "colleague": (
+        "这个人是用户的同事：先谈共事的情况和对方在工作上的难处，公私之间留一点距离。"
+        "要点里有他的家人、健康等情况（例如孩子刚出生、身体不舒服），也要简短提到，口吻是关心。"
+    ),
+    "subordinate": (
+        "这个人是用户的下属（用户带的人）：先谈他的工作情况、成长和难处，以及用户答应他的事。"
+        "语气关心，不居高临下，不说教。要点里有他的家人、健康等情况，也要提到，口吻是关心。"
+    ),
+}
+
+
+def build_summary_system_prompt(primary_relation: Optional[str]) -> str:
+    lens = RELATION_LENSES.get((primary_relation or "").strip(), NEUTRAL_LENS)
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+    return (
+        f"{SUMMARIZE_SYSTEM_PROMPT}\n"
+        f"今天的日期是 {today}。判断“多久没联系”“承诺是否已过期”时以此为准，"
+        f"用“三个多月”“上周”这样的说法，不要只罗列日期。\n"
+        f"关系说明：{lens}\n"
+    )
 
 
 SYSTEM_PROMPT = """你是一个从中文日记式文本中抽取人物信息、人物关系、承诺和金额信息的助手。
@@ -369,7 +440,8 @@ SYSTEM_PROMPT = """你是一个从中文日记式文本中抽取人物信息、�
 JSON 结构：
 {
   "persons": [{"name": "", "aliases": [], "how_met": "", "gender": "", "occupation": "",
-               "organization": "", "birth_date": "YYYY-MM-DD", "relation_to_me": "", "hometown": "",
+               "organization": "", "birth_date": "YYYY-MM-DD", "relation_to_me": "",
+               "primary_relation": "friend|family|colleague|superior|subordinate|client|partner", "hometown": "",
                "residence": "",
                "facts": []}],
   "relationships": [{"kind": "introduced_by|family|friend|colleague|partner|org_role|client|supplier|other",
@@ -399,6 +471,18 @@ JSON 结构：
    老张是被引荐对象），而不是以"我"作为 from_name，因为这样会丢失谁是介绍人这个关键信息。
 9. relation_to_me 只在原文明确体现说话人与该人物的关系时填写（如"我同学老张""朋友老李"），
    没有明确体现就留空，不要瞎猜。
+9a. primary_relation 是说话人与该人物最主要的关系，只能取下面七个值之一：
+    friend（朋友、同学等平辈的私人关系）、family（亲属、伴侣）、colleague（同事）、
+    superior（上级、领导、老板、老师、导师）、subordinate（下属、自己带的人）、
+    client（付钱给说话人或其公司的客户，包括正在谈的潜在客户）、
+    partner（合作方：供应商、合伙人、投资人、渠道等，和说话人对等合作或由说话人付钱的人）。
+    只有原文明确体现了这种关系才填；没有明确体现，或同时体现了几种身份、无法判断哪个最主要时，
+    留空字符串，不要猜。“某某介绍认识的”只说明怎么认识，不算关系。
+    例如“我同学老张”填 friend；“我们公司的客户王总”填 client；“我老板”填 superior；
+    “我带的实习生小王”填 subordinate；“我们的供应商老刘”填 partner。
+    一个人同时有两种以上不同类别的身份时，必须留空，让用户自己决定，不要替用户选一个：
+    例如“我大学同学老周现在是我们的客户”（同学属于 friend，客户属于 client）→ primary_relation 留空，
+    同时把 relation_to_me 写成“大学同学，现在是客户”。同类身份不算冲突，如“同学加朋友”都是 friend。
 9b. hometown 只填籍贯/老家（"浙江人""老家四川"）；residence 只填现在住在哪个城市
    （"住在杭州""常驻深圳""搬到上海了"）。两者不要混填：原文只说"在杭州"且看不出是老家
    还是现居地时，按现居地填 residence，hometown 留空。organization、occupation、residence
@@ -445,7 +529,7 @@ def summarize_person(payload: SummarizePersonRequest, authorization: Optional[st
 
     start = time.monotonic()
     try:
-        summary = call_deepseek_summary(payload.profile_text)
+        summary = call_deepseek_summary(payload.profile_text, payload.primary_relation)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -458,7 +542,7 @@ def summarize_person(payload: SummarizePersonRequest, authorization: Optional[st
     return SummarizePersonResponse(summary=summary)
 
 
-def call_deepseek_summary(profile_text: str) -> str:
+def call_deepseek_summary(profile_text: str, primary_relation: Optional[str] = None) -> str:
     from openai import OpenAI  # 依赖见 requirements.txt
 
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -466,7 +550,7 @@ def call_deepseek_summary(profile_text: str) -> str:
     completion = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
         messages=[
-            {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
+            {"role": "system", "content": build_summary_system_prompt(primary_relation)},
             {"role": "user", "content": profile_text},
         ],
         temperature=0.3,
