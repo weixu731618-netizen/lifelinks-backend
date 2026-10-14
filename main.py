@@ -16,6 +16,8 @@ import os
 import json
 import time
 import logging
+import threading
+from collections import defaultdict, deque
 from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -57,6 +59,41 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
 # 显式关掉换取更快更省的响应。见 https://api-docs.deepseek.com/guides/thinking_mode/
 NON_THINKING = {"thinking": {"type": "disabled"}}
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "30"))
+
+# 每用户调用频率限制（按 session token 里的用户标识计数）。
+# 每分钟限制防止脚本或循环请求；每日限制（按北京时间自然日）控制总成本。
+# 计数只保存在进程内存中，服务重启会清零；多实例部署需要改用数据库或 Redis。
+RATE_LIMITS = {
+    "extract": {"per_minute": 10, "per_day": 100},
+    "summarize_person": {"per_minute": 5, "per_day": 30},
+}
+_rate_lock = threading.Lock()
+_minute_hits: dict[tuple[str, str], deque] = defaultdict(deque)
+_day_hits: dict[tuple[str, str, str], int] = defaultdict(int)
+
+
+def enforce_rate_limit(endpoint: str, user_id: str) -> None:
+    """超过限制时抛出 429；未超过则记一次调用。应在调用 DeepSeek 之前执行。"""
+    limits = RATE_LIMITS[endpoint]
+    now = time.time()
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+    with _rate_lock:
+        window = _minute_hits[(endpoint, user_id)]
+        while window and now - window[0] >= 60:
+            window.popleft()
+        if len(window) >= limits["per_minute"]:
+            raise HTTPException(status_code=429, detail="请求太频繁，请稍后再试。")
+
+        day_key = (endpoint, user_id, today)
+        if _day_hits[day_key] >= limits["per_day"]:
+            raise HTTPException(status_code=429, detail="今天的 AI 调用次数已用完，明天再试。")
+
+        window.append(now)
+        _day_hits[day_key] += 1
+        # 删除非今天的计数，避免内存只增不减
+        for key in [k for k in _day_hits if k[2] != today]:
+            del _day_hits[key]
+
 
 app = FastAPI(title="LifeLinks Extraction Service")
 
@@ -342,6 +379,7 @@ def health():
 @app.post("/extract", response_model=ExtractResponse)
 def extract(payload: ExtractRequest, authorization: Optional[str] = Header(default=None)):
     user_id = check_auth(authorization)
+    enforce_rate_limit("extract", user_id)
 
     if not DEEPSEEK_API_KEY:
         raise HTTPException(
@@ -520,6 +558,7 @@ JSON 结构：
 @app.post("/summarize_person", response_model=SummarizePersonResponse)
 def summarize_person(payload: SummarizePersonRequest, authorization: Optional[str] = Header(default=None)):
     user_id = check_auth(authorization)
+    enforce_rate_limit("summarize_person", user_id)
 
     if not DEEPSEEK_API_KEY:
         raise HTTPException(
