@@ -628,7 +628,14 @@ def chat_completion(
     last_error: Optional[Exception] = None
     for provider in ai_providers():
         try:
-            client = OpenAI(api_key=provider.api_key, base_url=provider.base_url, timeout=REQUEST_TIMEOUT_SECONDS)
+            # App 端整体只等 30 秒，所以每个服务商各给一个短超时，且不在同一服务内重试，
+            # 失败后立刻切到下一个，保证整个请求在 App 的等待时间内返回。
+            client = OpenAI(
+                api_key=provider.api_key,
+                base_url=provider.base_url,
+                timeout=8 if provider.name == "deepseek" else 15,
+                max_retries=0,
+            )
             kwargs = {
                 "model": provider.model,
                 "messages": messages,
