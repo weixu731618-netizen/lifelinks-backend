@@ -18,6 +18,7 @@ import time
 import logging
 import threading
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -58,6 +59,12 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
 # 计费和耗时都按这部分算）。这两个任务都是"照要求转换/生成"，用不上多步思考，
 # 显式关掉换取更快更省的响应。见 https://api-docs.deepseek.com/guides/thinking_mode/
 NON_THINKING = {"thinking": {"type": "disabled"}}
+
+# 备用 AI 服务（OpenAI 兼容接口）。DeepSeek 调用失败（宕机、超时、报错）时自动改用这里配置的服务。
+# 三项都不配置就不启用备用；只配置备用、不配置 DeepSeek 也可以单独使用。
+BACKUP_AI_API_KEY = os.environ.get("BACKUP_AI_API_KEY", "")
+BACKUP_AI_BASE_URL = os.environ.get("BACKUP_AI_BASE_URL", "")
+BACKUP_AI_MODEL = os.environ.get("BACKUP_AI_MODEL", "")
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "30"))
 
 # 每用户调用频率限制（按 session token 里的用户标识计数）。
@@ -373,7 +380,12 @@ def terms_page():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ai_configured": bool(DEEPSEEK_API_KEY), "model": DEEPSEEK_MODEL}
+    return {
+        "status": "ok",
+        "ai_configured": bool(ai_providers()),
+        "model": DEEPSEEK_MODEL,
+        "backup_ai_configured": bool(BACKUP_AI_API_KEY and BACKUP_AI_BASE_URL and BACKUP_AI_MODEL),
+    }
 
 
 @app.post("/extract", response_model=ExtractResponse)
@@ -381,7 +393,7 @@ def extract(payload: ExtractRequest, authorization: Optional[str] = Header(defau
     user_id = check_auth(authorization)
     enforce_rate_limit("extract", user_id)
 
-    if not DEEPSEEK_API_KEY:
+    if not ai_providers():
         raise HTTPException(
             status_code=503,
             detail="服务端未配置 DEEPSEEK_API_KEY，无法调用真实模型。请在 backend/.env 中配置后重启服务，"
@@ -560,7 +572,7 @@ def summarize_person(payload: SummarizePersonRequest, authorization: Optional[st
     user_id = check_auth(authorization)
     enforce_rate_limit("summarize_person", user_id)
 
-    if not DEEPSEEK_API_KEY:
+    if not ai_providers():
         raise HTTPException(
             status_code=503,
             detail="服务端未配置 DEEPSEEK_API_KEY，无法调用真实模型。请在 backend/.env 中配置后重启服务。",
@@ -581,22 +593,71 @@ def summarize_person(payload: SummarizePersonRequest, authorization: Optional[st
     return SummarizePersonResponse(summary=summary)
 
 
-def call_deepseek_summary(profile_text: str, primary_relation: Optional[str] = None) -> str:
+@dataclass
+class AIProvider:
+    name: str
+    api_key: str
+    base_url: str
+    model: str
+    # DeepSeek 专用的关闭思考模式参数；备用服务不一定认识，所以只给 DeepSeek 带。
+    extra_body: Optional[dict] = None
+
+
+def ai_providers() -> list[AIProvider]:
+    """按优先级返回已配置的 AI 服务：DeepSeek 在前，备用服务在后。"""
+    providers = []
+    if DEEPSEEK_API_KEY:
+        providers.append(AIProvider("deepseek", DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, NON_THINKING))
+    if BACKUP_AI_API_KEY and BACKUP_AI_BASE_URL and BACKUP_AI_MODEL:
+        # 通义千问（DashScope 兼容接口）用 enable_thinking 控制思考模式，这里同样关闭，理由同上。
+        providers.append(AIProvider("backup", BACKUP_AI_API_KEY, BACKUP_AI_BASE_URL, BACKUP_AI_MODEL,
+                                    {"enable_thinking": False}))
+    return providers
+
+
+def chat_completion(
+    messages: list[dict],
+    *,
+    temperature: float,
+    max_tokens: int,
+    json_mode: bool = False,
+) -> str:
+    """依次尝试已配置的 AI 服务，第一个成功的结果即返回；全部失败则抛出最后一个错误。"""
     from openai import OpenAI  # 依赖见 requirements.txt
 
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=REQUEST_TIMEOUT_SECONDS)
+    last_error: Optional[Exception] = None
+    for provider in ai_providers():
+        try:
+            client = OpenAI(api_key=provider.api_key, base_url=provider.base_url, timeout=REQUEST_TIMEOUT_SECONDS)
+            kwargs = {
+                "model": provider.model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            if provider.extra_body:
+                kwargs["extra_body"] = provider.extra_body
+            completion = client.chat.completions.create(**kwargs)
+            return completion.choices[0].message.content or ""
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning("AI 服务 %s 调用失败，尝试下一个: %s", provider.name, type(exc).__name__)
 
-    completion = client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
+    logger.error("所有 AI 服务均调用失败")
+    raise RuntimeError("all AI providers failed") from last_error
+
+
+def call_deepseek_summary(profile_text: str, primary_relation: Optional[str] = None) -> str:
+    content = chat_completion(
         messages=[
             {"role": "system", "content": build_summary_system_prompt(primary_relation)},
             {"role": "user", "content": profile_text},
         ],
         temperature=0.3,
         max_tokens=600,
-        extra_body=NON_THINKING,
     )
-    content = completion.choices[0].message.content or ""
     if not content.strip():
         raise HTTPException(status_code=502, detail="AI 未能在限定长度内给出总结，请稍后重试。")
     return content.strip()
@@ -604,27 +665,19 @@ def call_deepseek_summary(profile_text: str, primary_relation: Optional[str] = N
 
 def call_deepseek(text: str, occurred_at_hint: Optional[str]) -> ExtractResponse:
     """
-    调用 DeepSeek（OpenAI 兼容接口）做结构化信息抽取。
+    做结构化信息抽取（DeepSeek 优先，失败时走备用服务）。
     """
-    from openai import OpenAI  # 依赖见 requirements.txt
-
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=REQUEST_TIMEOUT_SECONDS)
-
     user_prompt = f"发生时间参考：{occurred_at_hint or '未知'}\n原文：\n{text}"
 
-    completion = client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
+    raw_text = chat_completion(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        response_format={"type": "json_object"},
         temperature=0.2,
         max_tokens=8000,
-        extra_body=NON_THINKING,
-    )
-
-    raw_text = completion.choices[0].message.content or "{}"
+        json_mode=True,
+    ) or "{}"
     try:
         data = json.loads(raw_text)
     except json.JSONDecodeError as exc:
