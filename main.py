@@ -55,6 +55,9 @@ APPLE_PRIVATE_KEY = os.environ.get("APPLE_PRIVATE_KEY", "").replace("\\n", "\n")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
+# 识别名片/截图等图片专用的视觉模型；目前只有这一个模型支持图片输入，传给其他模型会报错。
+# 见 https://api-docs.deepseek.com/guides/vision
+DEEPSEEK_VISION_MODEL = os.environ.get("DEEPSEEK_VISION_MODEL", "deepseek-v4-flash-vision-exp")
 # deepseek-flash 默认开启思考模式（会先输出一大段 reasoning_content 再给正文，
 # 计费和耗时都按这部分算）。这两个任务都是"照要求转换/生成"，用不上多步思考，
 # 显式关掉换取更快更省的响应。见 https://api-docs.deepseek.com/guides/thinking_mode/
@@ -73,6 +76,8 @@ REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "30"))
 RATE_LIMITS = {
     "extract": {"per_minute": 10, "per_day": 100},
     "summarize_person": {"per_minute": 5, "per_day": 30},
+    # 图片识别调用成本更高，限额收紧一些。
+    "extract_card": {"per_minute": 5, "per_day": 20},
 }
 _rate_lock = threading.Lock()
 _minute_hits: dict[tuple[str, str], deque] = defaultdict(deque)
@@ -106,8 +111,21 @@ app = FastAPI(title="LifeLinks Extraction Service")
 
 
 class ExtractRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=4000)
+    text: str = Field(..., min_length=1, max_length=8000)
     occurred_at_hint: Optional[str] = None
+
+
+class ExtractCardRequest(BaseModel):
+    # base64 编码的图片，不带 data:xxx;base64, 前缀；上限按 32MB 原图的 base64 体积估算。
+    image_base64: str = Field(..., min_length=1, max_length=45_000_000)
+    image_mime: str = Field(default="image/jpeg")
+    occurred_at_hint: Optional[str] = None
+
+    @field_validator("image_mime")
+    @classmethod
+    def _normalize_mime(cls, value: str) -> str:
+        allowed = {"image/jpeg", "image/png", "image/webp", "image/heic"}
+        return value if value in allowed else "image/jpeg"
 
 
 class PersonOut(BaseModel):
@@ -373,6 +391,11 @@ def privacy_page():
     return legal.privacy_html()
 
 
+@app.get("/support", response_class=HTMLResponse)
+def support_page():
+    return legal.support_html()
+
+
 @app.get("/terms", response_class=HTMLResponse)
 def terms_page():
     return legal.terms_html()
@@ -384,6 +407,8 @@ def health():
         "status": "ok",
         "ai_configured": bool(ai_providers()),
         "model": DEEPSEEK_MODEL,
+        "vision_configured": bool(DEEPSEEK_API_KEY),
+        "vision_model": DEEPSEEK_VISION_MODEL,
         "backup_ai_configured": bool(BACKUP_AI_API_KEY and BACKUP_AI_BASE_URL and BACKUP_AI_MODEL),
     }
 
@@ -411,6 +436,33 @@ def extract(payload: ExtractRequest, authorization: Optional[str] = Header(defau
     finally:
         elapsed = time.monotonic() - start
         logger.info("extract 请求耗时 %.2fs，用户 sub=%s", elapsed, user_id)
+
+    return result
+
+
+@app.post("/extract_card", response_model=ExtractResponse)
+def extract_card(payload: ExtractCardRequest, authorization: Optional[str] = Header(default=None)):
+    """识别名片/含人名和联系方式的截图，直接从图片里抽取结构化信息。"""
+    user_id = check_auth(authorization)
+    enforce_rate_limit("extract_card", user_id)
+
+    if not DEEPSEEK_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="服务端未配置 DEEPSEEK_API_KEY，无法识别图片。请在 backend/.env 中配置后重启服务。",
+        )
+
+    start = time.monotonic()
+    try:
+        result = call_deepseek_card(payload.image_base64, payload.image_mime, payload.occurred_at_hint)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.error("名片图片识别失败: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="AI 图片识别调用失败，请稍后重试。") from exc
+    finally:
+        elapsed = time.monotonic() - start
+        logger.info("extract_card 请求耗时 %.2fs，用户 sub=%s", elapsed, user_id)
 
     return result
 
@@ -539,9 +591,10 @@ JSON 结构：
    原文表达了变动（"跳槽去了B公司""现在转做销售""搬到成都了"）时，填变动之后的最新值。
 10. facts 用来装其他所有不属于 gender/occupation/organization/birth_date/hometown/residence 的、
     关于这个人的具体事实，只要原文提到就写一条，每条一句简短的话，不要归纳总结，
-    也不要编造。参考但不限于这些维度：婚姻状况、子女情况、学历/毕业院校、行业、职级、
-    副业、收入、兴趣爱好、运动习惯、饮食偏好、宠物、旅行偏好、性格特点、沟通偏好、
-    健康状况、生日、纪念日，以及任何其他值得记住的具体信息（如"提到过想换工作"
+    也不要编造。参考但不限于这些维度：联系方式（手机号、微信号、邮箱、座机等，
+    原文出现的号码/账号必须原样抄录，不得改动任何一位数字或字符）、婚姻状况、子女情况、
+    学历/毕业院校、行业、职级、副业、收入、兴趣爱好、运动习惯、饮食偏好、宠物、旅行偏好、
+    性格特点、沟通偏好、健康状况、生日、纪念日，以及任何其他值得记住的具体信息（如"提到过想换工作"
     "孩子今年高考"）。原文没提到的维度完全不用出现在 facts 里，不要为了凑齐维度而编造。
 11. 一件事如果同时出现"这件事本身发生的时间"和"希望被提醒的时间"这两个不同的时间点
     （比如"3:50放学，然后下午3:40提醒我过去"），只生成一条 commitment，绝不能拆成两条：
@@ -633,7 +686,7 @@ def chat_completion(
             client = OpenAI(
                 api_key=provider.api_key,
                 base_url=provider.base_url,
-                timeout=8 if provider.name == "deepseek" else 15,
+                timeout=8 if provider.name == "deepseek" else 10,
                 max_retries=0,
             )
             kwargs = {
@@ -685,6 +738,51 @@ def call_deepseek(text: str, occurred_at_hint: Optional[str]) -> ExtractResponse
         max_tokens=8000,
         json_mode=True,
     ) or "{}"
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="AI 返回结果不是合法 JSON，请重试。") from exc
+
+    return ExtractResponse(**data)
+
+
+def call_deepseek_card(image_base64: str, image_mime: str, occurred_at_hint: Optional[str]) -> ExtractResponse:
+    """
+    用 DeepSeek 的视觉模型直接识别图片（名片、含人名/电话的截图等），抽取结构化信息。
+    只有专门的视觉模型支持图片输入，所以这里不走 chat_completion() 的多服务商轮询，
+    也不启用备用服务（备用服务商不一定支持图片）。
+    """
+    from openai import OpenAI  # 依赖见 requirements.txt
+
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=20, max_retries=0)
+    user_text = (
+        f"发生时间参考：{occurred_at_hint or '未知'}\n"
+        "这是一张名片或包含人名、联系方式的图片。请按系统说明的 JSON 结构提取信息；"
+        "姓名、电话、微信号、邮箱等必须和图片上的字符完全一致地抄录，不得识别错任何一位数字或字母，"
+        "也不要编造图片上没有的信息。"
+    )
+    try:
+        completion = client.chat.completions.create(
+            model=DEEPSEEK_VISION_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{image_base64}"}},
+                    ],
+                },
+            ],
+            temperature=0.2,
+            max_tokens=8000,
+            response_format={"type": "json_object"},
+        )
+        raw_text = completion.choices[0].message.content or "{}"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("DeepSeek 视觉模型调用失败: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="名片图片识别调用失败，请稍后重试。") from exc
+
     try:
         data = json.loads(raw_text)
     except json.JSONDecodeError as exc:

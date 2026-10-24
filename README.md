@@ -28,8 +28,10 @@ uvicorn main:app --reload --port 8000
 - Body: `{"identity_token": "<Sign in with Apple 返回的 identityToken>"}`
 - 返回：`{"session_token": "...", "user_id": "<Apple sub>", "expires_at": 1700000000}`
 
-`POST /extract` / `POST /summarize_person`
+`POST /extract` / `POST /extract_card` / `POST /summarize_person`
 - Header: `Authorization: Bearer <session_token>`（来自 /auth/apple）
+- `/extract_card`：识别名片等图片，Body 为 `{"image_base64": "...", "image_mime": "image/jpeg", "occurred_at_hint": "..."}`，
+  走 DeepSeek 的视觉模型（DEEPSEEK_VISION_MODEL），不经过备用服务。
 
 `POST /account/delete`
 - Header: `Authorization: Bearer <session_token>`
