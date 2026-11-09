@@ -15,6 +15,7 @@ LifeLinks 后端 —— 面向 iOS App 的 AI 结构化提取服务。
 import os
 import json
 import time
+import hashlib
 import logging
 import threading
 from collections import defaultdict, deque
@@ -47,10 +48,13 @@ APPLE_KEYS_URL = "https://appleid.apple.com/auth/keys"
 APPLE_TOKEN_URL = "https://appleid.apple.com/auth/token"
 APPLE_REVOKE_URL = "https://appleid.apple.com/auth/revoke"
 # 删除账号时撤销 Sign in with Apple 授权所需（Apple 开发者后台 → Keys 创建的 .p8 私钥）。
-# 三项都配置了才会真正调用 Apple 的 revoke 接口；未配置时只做 session 校验并返回 apple_revoked=false。
-APPLE_TEAM_ID = os.environ.get("APPLE_TEAM_ID", "9PG4KYBK7V")
+# 三项都配置了才能删除账号；未配置时 /account/delete 返回 503，不会谎报删除成功。
+APPLE_TEAM_ID = os.environ.get("APPLE_TEAM_ID", "5FUF8QK6M5")
 APPLE_KEY_ID = os.environ.get("APPLE_KEY_ID", "")
 APPLE_PRIVATE_KEY = os.environ.get("APPLE_PRIVATE_KEY", "").replace("\\n", "\n")
+# 已删除账号的吊销记录。session token 是无状态 JWT，删除账号时只能靠这份记录拒绝旧 token。
+# 必须放在重启和重新部署后仍保留的持久磁盘上，否则吊销记录会随之丢失。
+REVOKED_SESSIONS_PATH = os.environ.get("REVOKED_SESSIONS_PATH", "revoked_sessions.json")
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -113,6 +117,8 @@ app = FastAPI(title="LifeLinks Extraction Service")
 class ExtractRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=8000)
     occurred_at_hint: Optional[str] = None
+    # text 是图片经本地 OCR 得到的文字（可能含乱码）时为 true，此时额外返回整理后的 clean_text。
+    is_ocr_text: bool = False
 
 
 class ExtractCardRequest(BaseModel):
@@ -183,6 +189,16 @@ class ExtractResponse(BaseModel):
     commitments: list[CommitmentOut] = []
     money_mentions: list[MoneyOut] = []
     project_name_hint: Optional[str] = None
+    # 图片内容整理后的备忘文字，只有图片/OCR 请求才有。
+    clean_text: Optional[str] = None
+
+    @field_validator("clean_text", mode="before")
+    @classmethod
+    def _normalize_clean_text(cls, value):
+        # 这是附加内容，格式不对时当作没有，不能让整条提取失败。
+        if not isinstance(value, str):
+            return None
+        return value.strip() or None
 
 
 class SummarizePersonRequest(BaseModel):
@@ -284,6 +300,53 @@ def auth_apple(payload: AppleAuthRequest):
     return AppleAuthResponse(session_token=session_token, user_id=apple_sub, expires_at=expires_at)
 
 
+# 用户标识摘要 -> 吊销时间。只存摘要，删除账号后不再保留用户标识本身。
+# 与限流计数一样按单进程设计，多实例部署需要改用数据库或 Redis。
+_revoked_lock = threading.Lock()
+
+
+def _user_digest(user_id: str) -> str:
+    return hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+
+
+def _load_revoked_sessions() -> dict[str, int]:
+    try:
+        with open(REVOKED_SESSIONS_PATH, encoding="utf-8") as f:
+            return {str(k): int(v) for k, v in json.load(f).items()}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, AttributeError, TypeError) as exc:
+        logger.error("读取吊销记录失败: %s", type(exc).__name__)
+        return {}
+
+
+_revoked_sessions = _load_revoked_sessions()
+
+
+def revoke_user_sessions(user_id: str) -> None:
+    """让该用户此刻之前签发的 session token 全部失效；之后重新登录签发的 token 不受影响。"""
+    now = int(time.time())
+    with _revoked_lock:
+        _revoked_sessions[_user_digest(user_id)] = now
+        # 超过 token 有效期的记录已经没有作用，清掉。
+        for digest in [d for d, at in _revoked_sessions.items() if now - at > SESSION_TOKEN_TTL_SECONDS]:
+            del _revoked_sessions[digest]
+        tmp_path = f"{REVOKED_SESSIONS_PATH}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(_revoked_sessions, f)
+            os.replace(tmp_path, REVOKED_SESSIONS_PATH)
+        except OSError as exc:
+            # Apple 授权此时已撤销，不能再让删除失败；内存里的记录在本进程内仍然生效。
+            logger.error("写入吊销记录失败: %s", type(exc).__name__)
+
+
+def is_session_revoked(user_id: str, issued_at: int) -> bool:
+    with _revoked_lock:
+        revoked_at = _revoked_sessions.get(_user_digest(user_id))
+    return revoked_at is not None and issued_at <= revoked_at
+
+
 def check_auth(authorization: Optional[str]) -> str:
     """校验 App 自己签发的 session token，返回其中的用户标识（苹果 sub），用于按用户区分/记日志。"""
     if not SESSION_JWT_SECRET:
@@ -298,7 +361,10 @@ def check_auth(authorization: Optional[str]) -> str:
         claims = jwt.decode(token, SESSION_JWT_SECRET, algorithms=["HS256"])
     except jwt.InvalidTokenError as exc:
         raise HTTPException(status_code=401, detail="登录凭证无效或已过期，请重新登录") from exc
-    return claims.get("sub", "unknown")
+    user_id = claims.get("sub", "unknown")
+    if is_session_revoked(user_id, int(claims.get("iat", 0))):
+        raise HTTPException(status_code=401, detail="登录凭证已失效，请重新登录")
+    return user_id
 
 
 def _apple_revoke_configured() -> bool:
@@ -369,21 +435,22 @@ def revoke_apple_authorization(authorization_code: str, expected_sub: str) -> No
 def delete_account(payload: DeleteAccountRequest, authorization: Optional[str] = Header(default=None)):
     """
     删除账号。服务端不保存任何用户内容数据，所以这里没有数据库记录要删：
-    要做的是撤销 Apple 授权（App Store 审核 5.1.1(v) 要求），之后该 session 对应的用户需重新登录才会再次授权。
+    要做的是撤销 Apple 授权（App Store 审核 5.1.1(v) 要求），并让此前签发的 session token 失效。
+    没配置撤销所需的密钥时直接报错，不能告诉用户账号已删除。
     """
     user_id = check_auth(authorization)
 
-    revoked = False
-    if _apple_revoke_configured():
-        if not payload.authorization_code:
-            raise HTTPException(status_code=400, detail="缺少 Apple 授权码，请重新验证身份后再删除账号。")
-        revoke_apple_authorization(payload.authorization_code, user_id)
-        revoked = True
-    else:
-        logger.warning("未配置 APPLE_TEAM_ID/APPLE_KEY_ID/APPLE_PRIVATE_KEY，跳过撤销 Apple 授权")
+    if not _apple_revoke_configured():
+        logger.error("未配置 APPLE_TEAM_ID/APPLE_KEY_ID/APPLE_PRIVATE_KEY，无法删除账号")
+        raise HTTPException(status_code=503, detail="账号删除服务暂不可用，账号未被删除，请稍后重试或联系我们。")
+    if not payload.authorization_code:
+        raise HTTPException(status_code=400, detail="缺少 Apple 授权码，请重新验证身份后再删除账号。")
 
-    logger.info("账号已删除，用户 sub=%s，apple_revoked=%s", user_id, revoked)
-    return DeleteAccountResponse(deleted=True, apple_revoked=revoked)
+    revoke_apple_authorization(payload.authorization_code, user_id)
+    revoke_user_sessions(user_id)
+
+    logger.info("账号已删除，用户 sub=%s", user_id)
+    return DeleteAccountResponse(deleted=True, apple_revoked=True)
 
 
 @app.get("/privacy", response_class=HTMLResponse)
@@ -410,6 +477,7 @@ def health():
         "vision_configured": bool(DEEPSEEK_API_KEY),
         "vision_model": DEEPSEEK_VISION_MODEL,
         "backup_ai_configured": bool(BACKUP_AI_API_KEY and BACKUP_AI_BASE_URL and BACKUP_AI_MODEL),
+        "apple_revoke_configured": _apple_revoke_configured(),
     }
 
 
@@ -427,7 +495,7 @@ def extract(payload: ExtractRequest, authorization: Optional[str] = Header(defau
 
     start = time.monotonic()
     try:
-        result = call_deepseek(payload.text, payload.occurred_at_hint)
+        result = call_deepseek(payload.text, payload.occurred_at_hint, payload.is_ocr_text)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -620,6 +688,14 @@ JSON 结构：
 """
 
 
+CLEAN_TEXT_INSTRUCTION = """另外在 JSON 顶层增加一个 clean_text 字段，内容是整理后的备忘文字：
+- 保留能确认的全部有用信息：姓名、公司、职务、电话、微信、邮箱、地址、时间、事项；
+- 姓名、号码、账号、邮箱必须原样抄录，不得改动任何一位；
+- 去掉乱码、无意义字符、水印、广告和界面按钮文字；
+- 看不清或无法确认的内容直接省略，不要猜，也不要添加原内容没有的信息；
+- 每项信息一行，例如“电话：13800000000”；没有可保留的内容时 clean_text 留空字符串。"""
+
+
 @app.post("/summarize_person", response_model=SummarizePersonResponse)
 def summarize_person(payload: SummarizePersonRequest, authorization: Optional[str] = Header(default=None)):
     user_id = check_auth(authorization)
@@ -723,11 +799,13 @@ def call_deepseek_summary(profile_text: str, primary_relation: Optional[str] = N
     return content.strip()
 
 
-def call_deepseek(text: str, occurred_at_hint: Optional[str]) -> ExtractResponse:
+def call_deepseek(text: str, occurred_at_hint: Optional[str], is_ocr_text: bool = False) -> ExtractResponse:
     """
     做结构化信息抽取（DeepSeek 优先，失败时走备用服务）。
     """
     user_prompt = f"发生时间参考：{occurred_at_hint or '未知'}\n原文：\n{text}"
+    if is_ocr_text:
+        user_prompt = f"下面的原文是图片经 OCR 识别出的文字，可能有乱码和错字。\n{user_prompt}\n\n{CLEAN_TEXT_INSTRUCTION}"
 
     raw_text = chat_completion(
         messages=[
@@ -759,7 +837,8 @@ def call_deepseek_card(image_base64: str, image_mime: str, occurred_at_hint: Opt
         f"发生时间参考：{occurred_at_hint or '未知'}\n"
         "这是一张名片或包含人名、联系方式的图片。请按系统说明的 JSON 结构提取信息；"
         "姓名、电话、微信号、邮箱等必须和图片上的字符完全一致地抄录，不得识别错任何一位数字或字母，"
-        "也不要编造图片上没有的信息。"
+        "也不要编造图片上没有的信息。\n"
+        f"{CLEAN_TEXT_INSTRUCTION}"
     )
     try:
         completion = client.chat.completions.create(

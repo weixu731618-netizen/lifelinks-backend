@@ -31,13 +31,17 @@ uvicorn main:app --reload --port 8000
 `POST /extract` / `POST /extract_card` / `POST /summarize_person`
 - Header: `Authorization: Bearer <session_token>`（来自 /auth/apple）
 - `/extract_card`：识别名片等图片，Body 为 `{"image_base64": "...", "image_mime": "image/jpeg", "occurred_at_hint": "..."}`，
-  走 DeepSeek 的视觉模型（DEEPSEEK_VISION_MODEL），不经过备用服务。
+  走 DeepSeek 的视觉模型（DEEPSEEK_VISION_MODEL），不经过备用服务。返回里多一个 `clean_text`：
+  去掉乱码后的备忘文字，App 用它替换本地 OCR 的文字。
+- `/extract` 传 `"is_ocr_text": true` 时表示文字来自图片 OCR，同样返回 `clean_text`（图片识别失败时的退路）。
 
 `POST /account/delete`
 - Header: `Authorization: Bearer <session_token>`
 - Body: `{"authorization_code": "<App 重新做 Apple 验证拿到的 code>"}`
-- 配置了 `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` 时，会用 code 换 token 并撤销 Apple 授权；
-  未配置则只返回 `apple_revoked=false`（上架前必须配置）。
+- 必须配置 `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY`：用 code 换 token 并撤销 Apple 授权，
+  再让该用户此前签发的 session token 失效。未配置时返回 503，不会报告删除成功。可用 `/health` 的 `apple_revoke_configured` 确认。
+- 吊销记录写在 `REVOKED_SESSIONS_PATH`（只存用户标识的 SHA-256 摘要），必须放在持久磁盘上，
+  否则重启或重新部署后，已删除账号的旧 token 会恢复有效。多实例部署需要改用数据库或 Redis。
 - 返回：`{"deleted": true, "apple_revoked": true}`
 
 `GET /privacy`、`GET /terms`：隐私政策与用户协议 HTML 页面，内容在 `legal.py`；
