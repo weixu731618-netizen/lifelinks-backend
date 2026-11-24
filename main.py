@@ -856,6 +856,8 @@ def call_deepseek_card(image_base64: str, image_mime: str, occurred_at_hint: Opt
             temperature=0.2,
             max_tokens=8000,
             response_format={"type": "json_object"},
+            # 和文字整理一样关掉思考模式：抄录名片用不上多步推理，实测能从约 3.8s 降到 1.5s，结果不变。
+            extra_body=NON_THINKING,
         )
         raw_text = completion.choices[0].message.content or "{}"
     except Exception as exc:  # noqa: BLE001
