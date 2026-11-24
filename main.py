@@ -696,6 +696,15 @@ CLEAN_TEXT_INSTRUCTION = """另外在 JSON 顶层增加一个 clean_text 字段�
 - 每项信息一行，例如“电话：13800000000”；没有可保留的内容时 clean_text 留空字符串。"""
 
 
+# 图片专用：图片可能是名片，也可能是截图、笔记、聊天记录、普通文字，都要把文字原样抄出来。
+IMAGE_CLEAN_TEXT_INSTRUCTION = """另外在 JSON 顶层增加一个 clean_text 字段，内容是图片上的文字：
+- 不管图片是名片、截图、聊天记录、手写笔记还是普通文字，都把能看清的正文原样抄录下来；
+- 保持原来的字句和换行顺序，不改写、不总结、不加“电话：”“姓名：”之类原图没有的标签；
+- 姓名、号码、账号、邮箱必须和图片上的字符完全一致，不得改动任何一位；
+- 去掉水印、广告、手机状态栏和界面按钮文字；看不清的字直接省略，不要猜；
+- 只有图片上确实没有任何文字时，clean_text 才留空字符串。"""
+
+
 @app.post("/summarize_person", response_model=SummarizePersonResponse)
 def summarize_person(payload: SummarizePersonRequest, authorization: Optional[str] = Header(default=None)):
     user_id = check_auth(authorization)
@@ -835,10 +844,11 @@ def call_deepseek_card(image_base64: str, image_mime: str, occurred_at_hint: Opt
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, timeout=20, max_retries=0)
     user_text = (
         f"发生时间参考：{occurred_at_hint or '未知'}\n"
-        "这是一张名片或包含人名、联系方式的图片。请按系统说明的 JSON 结构提取信息；"
+        "这是用户拍的照片或截图，可能是名片，也可能是笔记、聊天记录、普通文字。"
+        "请按系统说明的 JSON 结构提取其中的人物、事项等信息（没有就留空）；"
         "姓名、电话、微信号、邮箱等必须和图片上的字符完全一致地抄录，不得识别错任何一位数字或字母，"
         "也不要编造图片上没有的信息。\n"
-        f"{CLEAN_TEXT_INSTRUCTION}"
+        f"{IMAGE_CLEAN_TEXT_INSTRUCTION}"
     )
     try:
         completion = client.chat.completions.create(
